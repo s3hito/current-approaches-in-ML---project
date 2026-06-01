@@ -9,7 +9,10 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import argparse
 import threading
+import base64
+import requests
 
+_sr_session = requests.Session()
 ```
 
 
@@ -27,27 +30,17 @@ spec_to_db = torchaudio.transforms.AmplitudeToDB(stype="power", top_db=80.0)
 _dir_lock = threading.Lock()
 
 
-def calculate_sr(map_id, mods=None):
-    """
-    Calls the Node.js osu SR calculator.
-    """
-
+def calculate_sr(map_id, mods=None, content=None):
     if mods is None:
         mods = []
 
+    payload = {'mapId': map_id, 'mods': mods}
+    if content is not None:
+        payload['content'] = base64.b64encode(content.encode('utf-8')).decode('ascii')
 
-    # Build command
-    command = ["node", "./sr_map_calculator/sr.js", str(map_id)] + mods
-
-    # Run Node.js script
-    result = subprocess.check_output(
-        command,
-        text=True
-    )
-
-    # Convert JSON string -> Python dict
-    data = json.loads(result)
-    return data
+    response = _sr_session.post('http://localhost:3000', json=payload, timeout=30)
+    response.raise_for_status()
+    return response.json()
 
 
 def parse_osu_file(file_content):
@@ -86,23 +79,53 @@ def parse_osu_file(file_content):
             parts = line.split(",")
             if len(parts) >= 5:
                 obj = {
-                    "x": int(parts[0]), # [cite: 39]
-                    "y": int(parts[1]), # [cite: 39]
-                    "time": int(parts[2]), #
-                    "type": int(parts[3]), # [cite: 41]
-                    "hitsound": int(parts[4]) # [cite: 42]
+                    "x": int(parts[0]),
+                    "y": int(parts[1]),
+                    "time": int(parts[2]),
+                    "type": int(parts[3]),
+                    "hitsound": int(parts[4]),
+                    "end_x": int(parts[0]), # Default to start pos
+                    "end_y": int(parts[1]), # Default to start pos
+                    "attr_val": 0.0         # Will hold slider length or spinner duration
                 }
-                # Check for Spinner endTime [cite: 83] or Slider data [cite: 61]
-                # Bit 3 is Spinner
+
+                # Check for Spinner
                 if (obj["type"] & 8) and len(parts) >= 6:
                     obj["endTime"] = int(parts[5])
+                    obj["attr_val"] = float(obj["endTime"] - obj["time"])
+
+                # Check for Slider
+                elif (obj["type"] & 2) and len(parts) >= 8:
+                    curve_data = parts[5].split('|')
+                    # Grab curve type indicator: L, B, P, or C
+                    obj["curve_type"] = curve_data[0] if len(curve_data) > 0 else 'L'
+
+                    raw_anchors = curve_data[1:]
+                    MAX_ANCHORS = 3
+
+                    obj["anchor_coords"] = []
+                    for i in range(min(len(raw_anchors), MAX_ANCHORS)):
+                        pt = raw_anchors[i].split(':')
+                        if len(pt) == 2:
+                            obj["anchor_coords"].append((int(pt[0]), int(pt[1])))
+
+                    obj["num_anchors"] = len(obj["anchor_coords"])
+                    obj["attr_val"] = float(parts[7]) # Length
 
                 data["hit_objects"].append(obj)
 
-    rating = calculate_sr(53)['star_ratings']['NM'] #add start rating
-    data["difficulty"]["star_rating"] = rating["star_rating"]
-    data["difficulty"]["aim_rating"] = rating["aim_rating"]
-    data["difficulty"]["speed_rating"] = rating["speed_rating"]
+    try:
+        rating = calculate_sr(data['metadata']['BeatmapID'], content=file_content)['star_ratings']['NM']
+    except Exception as e:
+        print("Error during sr calculation:", e)
+    try:
+        data["difficulty"]["star_rating"] = rating["star_rating"]
+        data["difficulty"]["aim_rating"] = rating["aim_rating"]
+        data["difficulty"]["speed_rating"] = rating["speed_rating"]
+    except:
+        print("No difficulty data could be found")
+        data["difficulty"]["aim_rating"] = -1
+        data["difficulty"]["speed_rating"] = -1
     return data
 
 def process_osz(osz_path, output_dir):
@@ -121,7 +144,8 @@ def process_osz(osz_path, output_dir):
             with archive.open(map_difficulty) as f:
                 content = f.read().decode('utf-8', errors='ignore')
                 parsed_data = parse_osu_file(content)
-
+                if parsed_data["general"]["Mode"] != "0":
+                    continue
                 # Get associated audio filename from [General] [cite: 5]
                 audio_filename = parsed_data["general"].get("AudioFilename")
 
@@ -183,7 +207,7 @@ def process_audio(audio_path):
     else: spec_db_norm = torch.zeros_like(spec_db)
 
     torch.save(spec_db_norm, save_path+'/'+file_name)
-
+    os.remove(audio_path)
     return False, n_frames
 
 def create_combined_sequences(json_file, n_frames, debug=False):
@@ -202,7 +226,11 @@ def create_combined_sequences(json_file, n_frames, debug=False):
         difficulty = [float(data['difficulty'][key])/10 for key in data['difficulty'].keys()]
         difficulty = torch.tensor(difficulty).unsqueeze(1).repeat(1, n_frames).T
 
-        y = torch.zeros(n_frames, 10) #add the difficulty values
+        # Update y to hold 9 values: [is_obj, x, y, is_circle, is_slider, is_spinner, end_x, end_y, attr_val]
+        #y dimensions: 10 existing + 1 (num_anchors) + 6 (max 3 pairs of x,y) = 17
+        y = torch.zeros(n_frames, 17)
+        curve_map = {'L': 0, 'B': 1, 'P': 2, 'C': 3}
+
         for obj in hit_objects:
             ms = obj['time']
             frame_idx = int((ms * SAMPLE_RATE) / (1000 * HOP_LENGTH))
@@ -213,16 +241,27 @@ def create_combined_sequences(json_file, n_frames, debug=False):
                 y[frame_idx, 2] = obj['y'] / 384.0
 
                 obj_type = obj['type']
-                if obj_type > 6:
-                    obj_type = 0
-                if obj_type == 0: y[frame_idx, 3] = 1.0
-                if obj_type == 1: y[frame_idx, 4] = 1.0
-                if obj_type == 2: y[frame_idx, 5] = 1.0
-                if obj_type == 3: y[frame_idx, 6] = 1.0
-                if obj_type == 4: y[frame_idx, 7] = 1.0
-                if obj_type == 5: y[frame_idx, 8] = 1.0
-                if obj_type == 6: y[frame_idx, 9] = 1.0
+                # Bitwise extraction
+                if obj_type & 1: y[frame_idx, 3] = 1.0 # Circle
+                if obj_type & 2: y[frame_idx, 4] = 1.0 # Slider
+                if obj_type & 8: y[frame_idx, 5] = 1.0 # Spinner
 
+
+                y[frame_idx, 6] = obj['end_x'] / 512.0
+                y[frame_idx, 7] = obj['end_y'] / 384.0
+                y[frame_idx, 8] = obj['attr_val'] / 1000.0 # Normalize length/duration to keep gradients stable
+                if obj_type & 2:
+                    y[frame_idx, 9] = float(curve_map.get(obj.get("curve_type", "L"), 0))
+                    if y[frame_idx, 9]>0:
+                        pass
+                    num_anchors = obj.get("num_anchors", 0)
+                    y[frame_idx, 10] = float(num_anchors)
+
+                    # Fill anchor coordinates sequentially
+                    anchors = obj.get("anchor_coords", [])
+                    for i in range(num_anchors):
+                        y[frame_idx, 11 + (i*2)] = anchors[i][0] / 512.0
+                        y[frame_idx, 12 + (i*2)] = anchors[i][1] / 384.0
         seq_comb = torch.cat((y, difficulty), dim=1)
         torch.save(seq_comb, f"{root_folder}/{beatmap_id}_diff.pt")
         torch.save(metadata_to_save, f"{root_folder}/{beatmap_id}_meta.pt")
@@ -230,9 +269,8 @@ def create_combined_sequences(json_file, n_frames, debug=False):
 
 # Example Usage
 # process_osz("Reol - No title (VINXIS).osz", "training_data")
-threads=20
+threads=15
 files = glob.glob(rf"./raw/**/*.osz", recursive=True)
-with ThreadPoolExecutor(max_workers=threads) as executor:
-    executor.map(lambda f: process_osz(f, "processed"), files)
+for file in files:
+    process_osz(file, "processed")
 ```
-

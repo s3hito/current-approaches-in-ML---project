@@ -8,6 +8,7 @@ import math, glob, json
 from pathlib import Path
 from os.path import dirname
 
+
 class CustomDataset(Dataset):
     def __init__(self, all_samples, window_size=512, debug = False, inference = False):
         self.all_samples = all_samples
