@@ -1,0 +1,9 @@
+{
+  "name": "osu-sr-project",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "osu-sr-calculator": "^2.0.3"
+  }
+}
+

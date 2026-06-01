@@ -1,0 +1,238 @@
+```python
+import zipfile
+import io, shutil
+import subprocess
+import json
+import os, glob, torchaudio, torch
+import json
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import argparse
+import threading
+
+```
+
+
+```python
+
+SAMPLE_RATE = 22050
+HOP_LENGTH = 1024
+N_MELS = 100
+mel_transform = torchaudio.transforms.MelSpectrogram(
+    sample_rate=SAMPLE_RATE,
+    hop_length=HOP_LENGTH,
+    n_mels=N_MELS
+)
+spec_to_db = torchaudio.transforms.AmplitudeToDB(stype="power", top_db=80.0)
+_dir_lock = threading.Lock()
+
+
+def calculate_sr(map_id, mods=None):
+    """
+    Calls the Node.js osu SR calculator.
+    """
+
+    if mods is None:
+        mods = []
+
+
+    # Build command
+    command = ["node", "./sr_map_calculator/sr.js", str(map_id)] + mods
+
+    # Run Node.js script
+    result = subprocess.check_output(
+        command,
+        text=True
+    )
+
+    # Convert JSON string -> Python dict
+    data = json.loads(result)
+    return data
+
+
+def parse_osu_file(file_content):
+    """Parses the text content of a .osu file into a dictionary."""
+    data = {
+        "metadata": {},
+        "general": {},
+        "difficulty": {},
+        "hit_objects": []
+
+    }
+
+    current_section = None
+    lines = file_content.splitlines()
+
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("//"):
+            continue
+
+        # Identify sections [cite: 5]
+        if line.startswith("[") and line.endswith("]"):
+            current_section = line[1:-1]
+            continue
+
+        # Parse Key:Value pairs for General and Difficulty [cite: 5, 9]
+        if current_section in ["General", "Difficulty", "Metadata"]:
+            if ":" in line:
+                key, value = line.split(":", 1)
+                data[current_section.lower()][key.strip()] = value.strip()
+
+
+
+        # Parse Comma-separated HitObjects [cite: 39]
+        elif current_section == "HitObjects":
+            parts = line.split(",")
+            if len(parts) >= 5:
+                obj = {
+                    "x": int(parts[0]), # [cite: 39]
+                    "y": int(parts[1]), # [cite: 39]
+                    "time": int(parts[2]), #
+                    "type": int(parts[3]), # [cite: 41]
+                    "hitsound": int(parts[4]) # [cite: 42]
+                }
+                # Check for Spinner endTime [cite: 83] or Slider data [cite: 61]
+                # Bit 3 is Spinner
+                if (obj["type"] & 8) and len(parts) >= 6:
+                    obj["endTime"] = int(parts[5])
+
+                data["hit_objects"].append(obj)
+
+    rating = calculate_sr(53)['star_ratings']['NM'] #add start rating
+    data["difficulty"]["star_rating"] = rating["star_rating"]
+    data["difficulty"]["aim_rating"] = rating["aim_rating"]
+    data["difficulty"]["speed_rating"] = rating["speed_rating"]
+    return data
+
+def process_osz(osz_path, output_dir):
+    """Extracts audio and parses all .osu files within an .osz archive."""
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    with zipfile.ZipFile(osz_path, 'r') as archive:
+        file_list = archive.namelist()
+
+        # Find all .osu files [cite: 1]
+        maps_difficulties = [f for f in file_list if f.endswith('.osu')]
+        print(f"Found {len(maps_difficulties)} osu files in {osz_path}")
+        for map_difficulty in maps_difficulties:
+
+            with archive.open(map_difficulty) as f:
+                content = f.read().decode('utf-8', errors='ignore')
+                parsed_data = parse_osu_file(content)
+
+                # Get associated audio filename from [General] [cite: 5]
+                audio_filename = parsed_data["general"].get("AudioFilename")
+
+                map_folder = output_dir+rf'/{parsed_data["metadata"]["BeatmapSetID"]}'
+                with _dir_lock:
+                    Path(map_folder).mkdir(parents=True, exist_ok=True) #create dir with map ID
+
+                    if audio_filename in file_list:
+                        # Extract audio if not already present
+                        audio_out_path = os.path.join(map_folder, audio_filename)
+                        if not os.path.exists(audio_out_path):
+                            with archive.open(audio_filename) as audio_file, \
+                                open(audio_out_path, 'wb') as out_f:
+                                    out_f.write(audio_file.read())
+
+                        is_bad_file, n_frames = process_audio(audio_out_path)
+
+                        if not is_bad_file:
+                            # Add audio reference to metadata
+                            parsed_data["audio_path"] = audio_filename
+
+                            # Save the parsed map data as JSON for training
+                            json_name = f"{os.path.splitext(map_difficulty)[0]}.json"
+                            json_path = os.path.join(map_folder, json_name)
+                            with open(json_path, 'w') as jf:
+                                json.dump(parsed_data, jf, indent=4)
+                            create_combined_sequences(json_path, n_frames)
+
+def process_audio(audio_path):
+    save_path = os.path.dirname(audio_path)
+    file_name = os.path.basename(audio_path)+'.pt'
+    is_bad_file = False
+
+    try:
+        with open(audio_path, 'rb') as f:
+            buffer = io.BytesIO(f.read()) #for not locking the file. Read to the buffer and close
+
+        waveform, sr = torchaudio.load(buffer)
+    except Exception as e:
+        print(f"[BAD FILE] {audio_path}")
+        print(f"  -> {e}")
+        #shutil.rmtree(save_path)
+        os.remove(audio_path)
+        is_bad_file = True
+        return is_bad_file
+
+    if sr != SAMPLE_RATE:
+        waveform = torchaudio.transforms.Resample(sr, SAMPLE_RATE)(waveform)
+    waveform = torch.mean(waveform, dim=0, keepdim=True)
+    spec = mel_transform(waveform).squeeze(0)
+
+    n_frames = spec.shape[1]
+    spec_db = spec_to_db(spec)
+    db_max = spec_db.max()
+    db_min = spec_db.min()
+
+    if db_max - db_min > 1e-5:
+        spec_db_norm = (spec_db - db_min) / (db_max - db_min)
+    else: spec_db_norm = torch.zeros_like(spec_db)
+
+    torch.save(spec_db_norm, save_path+'/'+file_name)
+
+    return False, n_frames
+
+def create_combined_sequences(json_file, n_frames, debug=False):
+        with open(json_file, 'r') as file:
+            data = json.load(file)
+
+        folder_name = data['metadata']['BeatmapSetID']
+        root_folder = fr"./processed/{folder_name}"
+        hit_objects = data['hit_objects']
+        beatmap_id = data['metadata']['BeatmapID']
+        metadata_to_save = {'BeatmapSetID':folder_name, 'BeatmapID':beatmap_id, 'AudioFilename': data['general']['AudioFilename']}
+        if debug:
+            print(folder_name)
+
+
+        difficulty = [float(data['difficulty'][key])/10 for key in data['difficulty'].keys()]
+        difficulty = torch.tensor(difficulty).unsqueeze(1).repeat(1, n_frames).T
+
+        y = torch.zeros(n_frames, 10) #add the difficulty values
+        for obj in hit_objects:
+            ms = obj['time']
+            frame_idx = int((ms * SAMPLE_RATE) / (1000 * HOP_LENGTH))
+
+            if frame_idx < n_frames:
+                y[frame_idx, 0] = 1.0
+                y[frame_idx, 1] = obj['x'] / 512.0
+                y[frame_idx, 2] = obj['y'] / 384.0
+
+                obj_type = obj['type']
+                if obj_type > 6:
+                    obj_type = 0
+                if obj_type == 0: y[frame_idx, 3] = 1.0
+                if obj_type == 1: y[frame_idx, 4] = 1.0
+                if obj_type == 2: y[frame_idx, 5] = 1.0
+                if obj_type == 3: y[frame_idx, 6] = 1.0
+                if obj_type == 4: y[frame_idx, 7] = 1.0
+                if obj_type == 5: y[frame_idx, 8] = 1.0
+                if obj_type == 6: y[frame_idx, 9] = 1.0
+
+        seq_comb = torch.cat((y, difficulty), dim=1)
+        torch.save(seq_comb, f"{root_folder}/{beatmap_id}_diff.pt")
+        torch.save(metadata_to_save, f"{root_folder}/{beatmap_id}_meta.pt")
+        pass
+
+# Example Usage
+# process_osz("Reol - No title (VINXIS).osz", "training_data")
+threads=20
+files = glob.glob(rf"./raw/**/*.osz", recursive=True)
+with ThreadPoolExecutor(max_workers=threads) as executor:
+    executor.map(lambda f: process_osz(f, "processed"), files)
+```
+
